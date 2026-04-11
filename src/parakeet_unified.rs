@@ -268,7 +268,6 @@ impl ParakeetUnified {
                 break;
             }
 
-            let total_received = self.buffer_start_sample + self.audio_buffer.len();
             let (window_audio, left_encoder_frames, chunk_encoder_frames) =
                 self.build_window_audio(self.next_chunk_start_sample, total_received, flush);
             if chunk_encoder_frames == 0 {

@@ -14,7 +14,7 @@ Files: encoder.onnx, encoder.onnx.data, decoder_joint.onnx, tokenizer.model
 Place in: ./unified/
 */
 
-use parakeet_rs::ParakeetUnified;
+use parakeet_rs::{ParakeetUnified, TimestampMode, Transcriber};
 use std::env;
 use std::io::Write;
 use std::time::Instant;
@@ -82,7 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", remaining);
         }
 
-        println!("\n\nFinal: {}", model.get_transcript());
+        let result = model.get_timed_transcript(TimestampMode::Sentences);
+        println!("\n\nFinal: {}", result.text);
+
+        println!("\nSentences:");
+        for segment in &result.tokens {
+            println!("[{:.2}s - {:.2}s]: {}", segment.start, segment.end, segment.text);
+        }
 
         let elapsed = transcribe_start.elapsed();
         println!(
@@ -92,13 +98,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             duration / elapsed.as_secs_f32()
         );
     } else {
-        println!("Offline mode");
+        println!("Offline mode (with word timestamps)");
 
         let transcribe_start = Instant::now();
-        let text = model.transcribe_file(audio_path)?;
+        let result = model.transcribe_samples(
+            audio,
+            spec.sample_rate,
+            spec.channels,
+            Some(TimestampMode::Words),
+        )?;
         let elapsed = transcribe_start.elapsed();
 
-        println!("Result: {}", text);
+        println!("Result: {}", result.text);
+
+        println!("\nWords (first 20):");
+        for word in result.tokens.iter().take(20) {
+            println!("[{:.2}s - {:.2}s]: {}", word.start, word.end, word.text);
+        }
+
         println!(
             "Transcribed in {:.2}s (audio: {:.1}s, RTF: {:.2}x)",
             elapsed.as_secs_f32(),

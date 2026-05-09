@@ -26,6 +26,7 @@
 
 use crate::audio::extract_features_raw;
 use crate::config::PreprocessorConfig;
+use crate::decode_util::{argmax, find_ngram_repetition};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_cohere::{CohereEncoderOutput, CohereModel, CoherePastKv, N_MELS};
@@ -396,64 +397,13 @@ fn require_token(tokenizer: &Tokenizer, literal: &str) -> Result<i64> {
         .ok_or_else(|| Error::Tokenizer(format!("Tokenizer is missing required token {literal}")))
 }
 
-/// Check if the token sequence ends with a repeated n-gram of length
-/// `>= min_len`. Returns `Some(repeat_len)` if the last `repeat_len` tokens
-/// are an exact copy of the preceding segment.
-fn find_ngram_repetition(tokens: &[i64], min_len: usize) -> Option<usize> {
-    let n = tokens.len();
-    if n < min_len * 2 {
-        return None;
-    }
-    for repeat_len in min_len..=(n / 2) {
-        let tail = &tokens[n - repeat_len..];
-        let prev = &tokens[n - 2 * repeat_len..n - repeat_len];
-        if tail == prev {
-            return Some(repeat_len);
-        }
-    }
-    None
-}
-
-/// Greedy argmax over a slice of f32 logits.
-fn argmax(logits: &[f32]) -> i64 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_argmax() {
-        assert_eq!(argmax(&[0.1, 0.5, 0.3, 0.9, 0.2]), 3);
-        assert_eq!(argmax(&[1.0, 0.0, 0.0]), 0);
-    }
-
-    #[test]
     fn test_supported_languages_count() {
         // Cohere Transcribe officially ships trained weights for 14 languages
         assert_eq!(SUPPORTED_LANGUAGES.len(), 14);
-    }
-
-    #[test]
-    fn test_ngram_repetition_detection() {
-        // No repetition
-        assert_eq!(find_ngram_repetition(&[1, 2, 3, 4, 5, 6, 7, 8], 4), None);
-
-        // Repeated 4-gram: [1,2,3,4] appears twice
-        assert_eq!(find_ngram_repetition(&[1, 2, 3, 4, 1, 2, 3, 4], 4), Some(4));
-
-        // Repeated 8-gram
-        let mut tokens = vec![10, 20, 30, 40, 50, 60, 70, 80];
-        tokens.extend_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80]);
-        assert_eq!(find_ngram_repetition(&tokens, 8), Some(8));
-
-        // Too short to detect
-        assert_eq!(find_ngram_repetition(&[1, 2, 1, 2], 4), None);
     }
 }

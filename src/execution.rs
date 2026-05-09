@@ -45,6 +45,28 @@ pub struct ModelConfig {
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
     pub coreml_cache_dir: Option<PathBuf>,
+    /// CoreML model format. `MLProgram` (Core ML 5+, macOS 12+) handles
+    /// fp16 weights and large graphs much better than the rc.12 default
+    /// (`NeuralNetwork`). For the Granite Speech 4.1 2b graphs in
+    /// particular, switching to `MLProgram` is the difference between
+    /// the CoreML compiler OOM'ing and producing a working session.
+    /// `None` leaves the rc.12 default in place. Only used when
+    /// execution_provider is CoreML.
+    #[cfg(feature = "coreml")]
+    pub coreml_model_format: Option<ort::ep::coreml::ModelFormat>,
+    /// CoreML compute units. `CPUAndGPU` skips the ANE compile pass,
+    /// which is the largest memory consumer when CoreML is loading the
+    /// 1B Granite LLM body. Defaults to `CPUAndGPU` if `None`. Only
+    /// used when execution_provider is CoreML.
+    #[cfg(feature = "coreml")]
+    pub coreml_compute_units: Option<ort::ep::coreml::ComputeUnits>,
+    /// If `true`, restrict the CoreML EP to claim only nodes with
+    /// statically known shapes. Opset-20 dynamic shapes stay on the
+    /// CPU fallback. Useful for diagnosing partition behaviour or in
+    /// combination with a static-shape re-export of the model. Only
+    /// used when execution_provider is CoreML.
+    #[cfg(feature = "coreml")]
+    pub coreml_require_static_shapes: bool,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -74,6 +96,12 @@ impl Default for ModelConfig {
             inter_threads: 1,
             configure: None,
             coreml_cache_dir: None,
+            #[cfg(feature = "coreml")]
+            coreml_model_format: None,
+            #[cfg(feature = "coreml")]
+            coreml_compute_units: None,
+            #[cfg(feature = "coreml")]
+            coreml_require_static_shapes: false,
         }
     }
 }
@@ -113,7 +141,40 @@ impl ModelConfig {
         self
     }
 
-    pub(crate) fn apply_to_session_builder(
+    /// Override the CoreML model format. `MLProgram` (Core ML 5+,
+    /// macOS 12+) is the recommended setting for the Granite Speech
+    /// 4.1 2b graphs - the rc.12 default (`NeuralNetwork`) hits
+    /// CoreML compiler OOM on consumer Macs at this scale.
+    #[cfg(feature = "coreml")]
+    pub fn with_coreml_model_format(mut self, fmt: ort::ep::coreml::ModelFormat) -> Self {
+        self.coreml_model_format = Some(fmt);
+        self
+    }
+
+    /// Override CoreML compute units. Defaults to `CPUAndGPU` which
+    /// skips the ANE compile pass; use `All` only on small graphs that
+    /// fit comfortably in ANE memory.
+    #[cfg(feature = "coreml")]
+    pub fn with_coreml_compute_units(mut self, units: ort::ep::coreml::ComputeUnits) -> Self {
+        self.coreml_compute_units = Some(units);
+        self
+    }
+
+    /// Restrict the CoreML EP to nodes with statically known shapes.
+    /// Opset-20 dynamic shapes stay on the CPU fallback. Combine with
+    /// a static-shape re-export of the model for the cleanest CoreML
+    /// partition.
+    #[cfg(feature = "coreml")]
+    pub fn with_coreml_require_static_shapes(mut self, enable: bool) -> Self {
+        self.coreml_require_static_shapes = enable;
+        self
+    }
+
+    /// Apply this config to an `ort` session builder. Used by the engine
+    /// types when constructing sessions; exposed publicly so callers
+    /// building bare `ort::session::Session`s can reuse the same EP option
+    /// resolution.
+    pub fn apply_to_session_builder(
         &self,
         builder: SessionBuilder,
     ) -> Result<SessionBuilder> {
@@ -153,8 +214,16 @@ impl ModelConfig {
             #[cfg(feature = "coreml")]
             ExecutionProvider::CoreML => {
                 use ort::ep::coreml::{ComputeUnits, CoreML};
-                let mut coreml = CoreML::default().with_compute_units(ComputeUnits::CPUAndGPU);
 
+                let units = self.coreml_compute_units.unwrap_or(ComputeUnits::CPUAndGPU);
+                let mut coreml = CoreML::default().with_compute_units(units);
+
+                if let Some(fmt) = self.coreml_model_format {
+                    coreml = coreml.with_model_format(fmt);
+                }
+                if self.coreml_require_static_shapes {
+                    coreml = coreml.with_static_input_shapes(true);
+                }
                 if let Some(cache_dir) = &self.coreml_cache_dir {
                     coreml = coreml.with_model_cache_dir(cache_dir.to_string_lossy());
                 }

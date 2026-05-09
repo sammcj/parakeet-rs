@@ -42,6 +42,21 @@ name = "cohere"
 path = "examples/cohere.rs"
 required-features = ["cohere"]
 
+[[example]]
+name = "granite"
+path = "examples/granite.rs"
+required-features = ["granite"]
+
+[[example]]
+name = "granite_plus"
+path = "examples/granite_plus.rs"
+required-features = ["granite-plus"]
+
+[[example]]
+name = "granite_nar"
+path = "examples/granite_nar.rs"
+required-features = ["granite-nar"]
+
 [dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
 hound = "3.5"
@@ -69,5 +84,22 @@ nnapi = ["ort/nnapi"]
 sortformer = []
 multitalker = ["sortformer"]
 cohere = []
+# IBM Granite Speech 4.1 family. Each variant is a separate feature so users
+# can pick exactly what they need; they share the same audio frontend module.
+# `granite` is the autoregressive base 2b (en/fr/de/es/pt/ja transcription,
+# bidirectional translation, keyword biasing). `granite-plus` adds inline
+# speaker tags, word-level timestamps, and incremental decoding (drops Japanese
+# and translation). `granite-nar` is non-autoregressive: a single-pass
+# bidirectional editor over a CTC draft (English transcription only, no
+# punctuation, no translation - lower latency than the AR variants).
+granite = []
+# `granite-plus` is a strict superset of `granite`: it shares the
+# encoder + AR decoder code path and only adds the inline tag parser
+# and timestamp rollover logic. The transitive dependency saves
+# duplicated session machinery at the cost of always pulling in the
+# base 2b code; if you build only `granite-plus` you still get
+# everything `granite` exports.
+granite-plus = ["granite"]
+granite-nar = []
 load-dynamic = ["ort/load-dynamic"]
 preload-dylibs = ["ort/preload-dylibs"]

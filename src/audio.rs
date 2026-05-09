@@ -39,32 +39,102 @@ pub fn apply_preemphasis(audio: &[f32], coef: f32) -> Vec<f32> {
     result
 }
 
-fn hann_window(window_length: usize) -> Vec<f32> {
-    (0..window_length)
-        .map(|i| 0.5 - 0.5 * ((2.0 * PI * i as f32) / (window_length as f32 - 1.0)).cos())
+/// Padding mode for [`stft`]. `Zero` matches NeMo / Cohere defaults;
+/// `Reflect` matches `torchaudio.transforms.Spectrogram(center=True,
+/// pad_mode="reflect")` used by Granite Speech.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum PadMode {
+    Zero,
+    Reflect,
+}
+
+/// Hann window definition for [`stft`]. `Symmetric` divides by
+/// `win_length - 1` and places the window at the start of the FFT
+/// buffer (NeMo / Cohere). `Periodic` divides by `win_length` and
+/// centre-pads the window into the FFT buffer (torchaudio default,
+/// Granite Speech).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum WindowMode {
+    Symmetric,
+    Periodic,
+}
+
+fn hann_symmetric(win_length: usize) -> Vec<f32> {
+    (0..win_length)
+        .map(|i| 0.5 - 0.5 * ((2.0 * PI * i as f32) / (win_length as f32 - 1.0)).cos())
         .collect()
+}
+
+fn hann_periodic_padded(win_length: usize, n_fft: usize) -> Vec<f32> {
+    debug_assert!(win_length <= n_fft);
+    let pad_left = (n_fft - win_length) / 2;
+    let mut w = vec![0.0f32; n_fft];
+    for i in 0..win_length {
+        w[pad_left + i] = 0.5 - 0.5 * ((2.0 * PI * i as f32) / win_length as f32).cos();
+    }
+    w
+}
+
+fn reflect_pad(audio: &[f32], pad: usize) -> Vec<f32> {
+    if audio.is_empty() {
+        return vec![0.0; pad * 2];
+    }
+    let n = audio.len();
+    let mut out = Vec::with_capacity(n + 2 * pad);
+    for i in (1..=pad).rev() {
+        let idx = i.min(n - 1);
+        out.push(audio[idx]);
+    }
+    out.extend_from_slice(audio);
+    for i in 1..=pad {
+        let idx = if n > i { n - 1 - i } else { 0 };
+        out.push(audio[idx]);
+    }
+    out
 }
 
 // We use proper FFT here instead of naive DFT because the model was trained
 // on correctly computed spectrograms. Naive DFT produces wrong frequency bins
 // and the model outputs all blank tokens. realfft (real-valued FFT wrapper around
 // RustFFT) gives us O(n log n) performance and numerically correct results.
+//
+// Returns the per-frame power spectrogram (`|FFT|^2`) of shape
+// `[n_fft/2 + 1, num_frames]`. The `pad_mode` and `window_mode` knobs let
+// the same function back both the NeMo / Cohere frontends (`Zero` +
+// `Symmetric`) and the torchaudio-style Granite frontend (`Reflect` +
+// `Periodic`).
 pub fn stft(
     audio: &[f32],
     n_fft: usize,
     hop_length: usize,
     win_length: usize,
+    pad_mode: PadMode,
+    window_mode: WindowMode,
 ) -> Result<Array2<f32>> {
     use realfft::RealFftPlanner;
 
     let pad_amount = n_fft / 2;
-    let mut padded = vec![0.0f32; pad_amount];
-    padded.extend_from_slice(audio);
-    padded.resize(padded.len() + pad_amount, 0.0);
+    let padded: Vec<f32> = match pad_mode {
+        PadMode::Zero => {
+            let mut p = vec![0.0f32; pad_amount];
+            p.extend_from_slice(audio);
+            p.resize(p.len() + pad_amount, 0.0);
+            p
+        }
+        PadMode::Reflect => reflect_pad(audio, pad_amount),
+    };
 
-    let window = hann_window(win_length);
-    let num_frames = (padded.len() - n_fft) / hop_length + 1;
     let freq_bins = n_fft / 2 + 1;
+    if padded.len() < n_fft {
+        // Audio shorter than one analysis window after padding: emit a
+        // single zero frame to match torchaudio's behaviour on tiny
+        // inputs. Both pad modes converge here.
+        return Ok(Array2::<f32>::zeros((freq_bins, 1)));
+    }
+
+    let num_frames = (padded.len() - n_fft) / hop_length + 1;
     let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
 
     let mut planner = RealFftPlanner::<f32>::new();
@@ -73,66 +143,128 @@ pub fn stft(
     let mut output = r2c.make_output_vec();
     let mut scratch = r2c.make_scratch_vec();
 
-    for frame_idx in 0..num_frames {
-        let start = frame_idx * hop_length;
-
-        input.fill(0.0);
-        for i in 0..win_length.min(padded.len() - start) {
-            input[i] = padded[start + i] * window[i];
+    match window_mode {
+        WindowMode::Symmetric => {
+            let window = hann_symmetric(win_length);
+            for frame_idx in 0..num_frames {
+                let start = frame_idx * hop_length;
+                input.fill(0.0);
+                for i in 0..win_length.min(padded.len() - start) {
+                    input[i] = padded[start + i] * window[i];
+                }
+                r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
+                    .map_err(|e| Error::Audio(format!("FFT failed: {e}")))?;
+                for k in 0..freq_bins {
+                    spectrogram[[k, frame_idx]] = output[k].norm_sqr();
+                }
+            }
         }
-
-        r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
-            .map_err(|e| Error::Audio(format!("FFT failed: {e}")))?;
-
-        for k in 0..freq_bins {
-            spectrogram[[k, frame_idx]] = output[k].norm_sqr();
+        WindowMode::Periodic => {
+            let window = hann_periodic_padded(win_length, n_fft);
+            for frame_idx in 0..num_frames {
+                let start = frame_idx * hop_length;
+                for i in 0..n_fft {
+                    input[i] = padded[start + i] * window[i];
+                }
+                r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
+                    .map_err(|e| Error::Audio(format!("FFT failed: {e}")))?;
+                for k in 0..freq_bins {
+                    spectrogram[[k, frame_idx]] = output[k].norm_sqr();
+                }
+            }
         }
     }
 
     Ok(spectrogram)
 }
 
-// Slaney mel scale (again librosa)
-const F_SP: f64 = 200.0 / 3.0;
-const MIN_LOG_HZ: f64 = 1000.0;
-const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
-const LOG_STEP: f64 = 0.06875177742094912;
+/// Mel scale variant for [`create_mel_filterbank`]. Slaney follows
+/// librosa's piecewise log/linear curve (NeMo / Cohere). Htk follows
+/// the original 2595*log10 closed form (Granite Speech / torchaudio).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum MelScale {
+    Slaney,
+    Htk,
+}
+
+/// Triangle-norm variant for [`create_mel_filterbank`]. Slaney divides
+/// each filter by the area between its endpoints (`2 / (right - left)`).
+/// `None` leaves the raw triangles unscaled (torchaudio `norm=None`).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum MelNorm {
+    Slaney,
+    None,
+}
+
+const SLANEY_F_SP: f64 = 200.0 / 3.0;
+const SLANEY_MIN_LOG_HZ: f64 = 1000.0;
+const SLANEY_MIN_LOG_MEL: f64 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
+const SLANEY_LOG_STEP: f64 = 0.06875177742094912;
 
 fn hz_to_mel_slaney(hz: f64) -> f64 {
-    if hz < MIN_LOG_HZ {
-        hz / F_SP
+    if hz < SLANEY_MIN_LOG_HZ {
+        hz / SLANEY_F_SP
     } else {
-        MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() / LOG_STEP
+        SLANEY_MIN_LOG_MEL + (hz / SLANEY_MIN_LOG_HZ).ln() / SLANEY_LOG_STEP
     }
 }
 
 fn mel_to_hz_slaney(mel: f64) -> f64 {
-    if mel < MIN_LOG_MEL {
-        mel * F_SP
+    if mel < SLANEY_MIN_LOG_MEL {
+        mel * SLANEY_F_SP
     } else {
-        MIN_LOG_HZ * ((mel - MIN_LOG_MEL) * LOG_STEP).exp()
+        SLANEY_MIN_LOG_HZ * ((mel - SLANEY_MIN_LOG_MEL) * SLANEY_LOG_STEP).exp()
     }
 }
 
-pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Array2<f32> {
+fn hz_to_mel_htk(f: f64) -> f64 {
+    2595.0 * (1.0 + f / 700.0).log10()
+}
+
+fn mel_to_hz_htk(m: f64) -> f64 {
+    700.0 * (10f64.powf(m / 2595.0) - 1.0)
+}
+
+pub fn create_mel_filterbank(
+    n_fft: usize,
+    n_mels: usize,
+    sample_rate: usize,
+    scale: MelScale,
+    norm: MelNorm,
+) -> Array2<f32> {
     let freq_bins = n_fft / 2 + 1;
     let mut filterbank = Array2::<f32>::zeros((n_mels, freq_bins));
 
     let fmax = sample_rate as f64 / 2.0;
-    let mel_min = hz_to_mel_slaney(0.0);
-    let mel_max = hz_to_mel_slaney(fmax);
+    let mel_points: Vec<f64> = match scale {
+        MelScale::Slaney => {
+            let mel_min = hz_to_mel_slaney(0.0);
+            let mel_max = hz_to_mel_slaney(fmax);
+            (0..=n_mels + 1)
+                .map(|i| {
+                    mel_to_hz_slaney(
+                        mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64,
+                    )
+                })
+                .collect()
+        }
+        MelScale::Htk => {
+            let mel_min = hz_to_mel_htk(0.0);
+            let mel_max = hz_to_mel_htk(fmax);
+            (0..=n_mels + 1)
+                .map(|i| {
+                    mel_to_hz_htk(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64)
+                })
+                .collect()
+        }
+    };
 
-    // Mel cent freq
-    let mel_points: Vec<f64> = (0..=n_mels + 1)
-        .map(|i| mel_to_hz_slaney(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64))
-        .collect();
-
-    // FFT bin freq
     let fft_freqs: Vec<f64> = (0..freq_bins)
         .map(|i| i as f64 * sample_rate as f64 / n_fft as f64)
         .collect();
 
-    // librosa's ramp
     let fdiff: Vec<f64> = mel_points.windows(2).map(|w| w[1] - w[0]).collect();
 
     for i in 0..n_mels {
@@ -143,11 +275,12 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
         }
     }
 
-    // Slaney norm
-    for i in 0..n_mels {
-        let enorm = 2.0 / (mel_points[i + 2] - mel_points[i]);
-        for k in 0..freq_bins {
-            filterbank[[i, k]] *= enorm as f32;
+    if matches!(norm, MelNorm::Slaney) {
+        for i in 0..n_mels {
+            let enorm = 2.0 / (mel_points[i + 2] - mel_points[i]);
+            for k in 0..freq_bins {
+                filterbank[[i, k]] *= enorm as f32;
+            }
         }
     }
 
@@ -189,10 +322,22 @@ pub fn extract_features_raw(
 
     audio = apply_preemphasis(&audio, config.preemphasis);
 
-    let spectrogram = stft(&audio, config.n_fft, config.hop_length, config.win_length)?;
+    let spectrogram = stft(
+        &audio,
+        config.n_fft,
+        config.hop_length,
+        config.win_length,
+        PadMode::Zero,
+        WindowMode::Symmetric,
+    )?;
 
-    let mel_filterbank =
-        create_mel_filterbank(config.n_fft, config.feature_size, config.sampling_rate);
+    let mel_filterbank = create_mel_filterbank(
+        config.n_fft,
+        config.feature_size,
+        config.sampling_rate,
+        MelScale::Slaney,
+        MelNorm::Slaney,
+    );
     let mel_spectrogram = mel_filterbank.dot(&spectrogram);
     // Log with additive guard (NeMo: log_zero_guard_type="add", value=2^-24)
     let log_zero_guard: f32 = 2.0f32.powi(-24);
@@ -243,7 +388,15 @@ mod tests {
         let sample_rate = 16000;
         let audio = sine_wave(1000.0, sample_rate, sample_rate);
 
-        let spec = stft(&audio, n_fft, hop_length, win_length).unwrap();
+        let spec = stft(
+            &audio,
+            n_fft,
+            hop_length,
+            win_length,
+            PadMode::Zero,
+            WindowMode::Symmetric,
+        )
+        .unwrap();
 
         // Expected bin for 1kHz: freq_hz * n_fft / sample_rate = 1000 * 512 / 16000 = 32
         let expected_bin = 32;
@@ -274,13 +427,41 @@ mod tests {
     }
 
     #[test]
+    fn htk_mel_endpoints_match_reference() {
+        // HTK closed-form: mel(0) = 0; mel(8000) ≈ 2840.023.
+        let m0 = hz_to_mel_htk(0.0);
+        let m1 = hz_to_mel_htk(8000.0);
+        assert!(m0.abs() < 1e-9, "expected ~0, got {m0}");
+        assert!(
+            (m1 - 2840.0230).abs() < 1e-3,
+            "expected ~2840.023, got {m1}"
+        );
+        let h = mel_to_hz_htk(m1);
+        assert!((h - 8000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn htk_filterbank_has_n_mels_rows() {
+        let fb = create_mel_filterbank(512, 80, 16000, MelScale::Htk, MelNorm::None);
+        assert_eq!(fb.shape(), &[80, 257]);
+    }
+
+    #[test]
     fn stft_output_shape_is_correct() {
         let n_fft = 512;
         let hop_length = 160;
         let win_length = 400;
         let audio = vec![0.0f32; 16000]; // 1 second of silence
 
-        let spec = stft(&audio, n_fft, hop_length, win_length).unwrap();
+        let spec = stft(
+            &audio,
+            n_fft,
+            hop_length,
+            win_length,
+            PadMode::Zero,
+            WindowMode::Symmetric,
+        )
+        .unwrap();
 
         let freq_bins = n_fft / 2 + 1;
         assert_eq!(spec.shape()[0], freq_bins);

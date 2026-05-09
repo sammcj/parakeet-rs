@@ -250,7 +250,13 @@ impl NemotronHandle {
 
         let exec = exec_config.unwrap_or_default();
         let model = NemotronModel::from_pretrained(path, exec, model_config)?;
-        let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        let mel_basis = crate::audio::create_mel_filterbank(
+            N_FFT,
+            N_MELS,
+            SAMPLE_RATE,
+            crate::audio::MelScale::Slaney,
+            crate::audio::MelNorm::Slaney,
+        );
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -575,7 +581,14 @@ impl Nemotron {
         }
 
         let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&preemph, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
+        let spec = crate::audio::stft(
+            &preemph,
+            N_FFT,
+            HOP_LENGTH,
+            WIN_LENGTH,
+            crate::audio::PadMode::Zero,
+            crate::audio::WindowMode::Symmetric,
+        )?;
         let mel = self.mel_basis.dot(&spec);
 
         Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))

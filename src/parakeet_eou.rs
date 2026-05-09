@@ -256,7 +256,14 @@ impl ParakeetEOU {
 
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {
         let audio_pre = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&audio_pre, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
+        let spec = crate::audio::stft(
+            &audio_pre,
+            N_FFT,
+            HOP_LENGTH,
+            WIN_LENGTH,
+            crate::audio::PadMode::Zero,
+            crate::audio::WindowMode::Symmetric,
+        )?;
         let mel = self.mel_basis.dot(&spec);
         let mel_log = mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln());
         Ok(mel_log.insert_axis(ndarray::Axis(0)))

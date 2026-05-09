@@ -69,6 +69,66 @@ for chunk in audio.chunks(CHUNK_SIZE) {
 }
 ```
 
+**IBM Granite Speech 4.1**: Three variants of a 2B-parameter Conformer + Q-Former + Granite 4.0 1B LLM ASR model. Base supports multilingual transcription and translation. Plus adds inline speaker tags and word-level timestamps. NAR (non-autoregressive) is a single-pass bidirectional editor over a CTC draft - English transcription only, lower latency than the AR variants.
+
+```toml
+parakeet-rs = { version = "0.3", features = ["granite-plus"] } # base + plus
+# or `granite` for base only, or `granite-nar` for the NAR variant
+```
+
+```rust
+// Base 2b: punctuation, multilingual transcription, translation, keyword biasing
+use parakeet_rs::{Granite, GraniteOptions};
+
+let mut granite = Granite::from_pretrained("./granite-speech-4.1-2b-onnx", None)?;
+let text = granite.transcribe_audio(&audio, &GraniteOptions::transcribe_with_punctuation())?;
+
+// Translation (English -> French)
+let fr = granite.transcribe_audio(&audio, &GraniteOptions::translate_to("French"))?;
+
+// Keyword biasing for names / acronyms / domain terms
+let biased = granite.transcribe_audio(
+    &audio,
+    &GraniteOptions::transcribe_with_keywords(["Sammy", "IBM", "ONNX"]),
+)?;
+```
+
+```rust
+// Plus 2b: speaker-attributed ASR + word timestamps + incremental decoding
+use parakeet_rs::{GranitePlus, GranitePlusOptions};
+
+let mut plus = GranitePlus::from_pretrained("./granite-speech-4.1-2b-plus-onnx", None)?;
+
+// Speaker-attributed ASR (inline [Speaker N]: tags lifted into typed segments)
+let result = plus.transcribe_audio(&audio, &GranitePlusOptions::speaker_attributed())?;
+for seg in &result.segments {
+    println!("[Speaker {}] {}", seg.speaker, seg.text);
+}
+
+// Word-level timestamps (centisecond rollover handled automatically)
+let result = plus.transcribe_audio(&audio, &GranitePlusOptions::word_timestamps())?;
+for w in &result.words {
+    println!("[{:.2}s] {}", w.end_time, if w.is_silence { "<silence>" } else { &w.word });
+}
+
+// Incremental decoding for long audio: pass the previous chunk's transcript
+// so the model keeps speaker numbering stable.
+let result = plus.transcribe_audio(
+    &chunk2,
+    &GranitePlusOptions::speaker_attributed().with_prefix_text(&previous_transcript),
+)?;
+```
+
+```rust
+// NAR 2b: single-pass English transcription, no autoregressive loop
+use parakeet_rs::{GraniteNar, GraniteNarOptions};
+
+let mut nar = GraniteNar::from_pretrained("./granite-speech-4.1-2b-nar-onnx", None)?;
+let text = nar.transcribe_audio(&audio, &GraniteNarOptions::default())?;
+```
+
+Bundles ship three precision tiers (`fp32/`, `fp16w/`, `int8/`); `fp16w` is the recommended default for accelerated inference (FP16 weights, FP32 compute, transcripts byte-exact vs the PyTorch reference). Plus's drawback vs base is that it does not produce punctuation or capitalisation, the trade-off for gaining structured outputs. NAR drops translation, punctuation, and the structural features in exchange for a single-pass decode. See `examples/granite.rs`, `examples/granite_plus.rs`, and `examples/granite_nar.rs` for runnable demos. Acceleration: `--features granite-plus,coreml` for Metal on macOS, `--features granite-plus,cuda` on Linux/Windows (replace `granite-plus` with `granite` or `granite-nar` for those variants).
+
 **Cohere Transcribe (Offline Multilingual)**: 14 languages, punctuation & ITN toggles (yes, "parakeets🦜" talk about more than just NVIDIA right?? :-P)
 ```toml
 parakeet-rs = { version = "0.3", features = ["cohere"] }
@@ -149,6 +209,10 @@ See `scripts/export_diar_sortformer.py` for exporting the model with custom stre
 
 **Cohere Transcribe**: Download from [HuggingFace](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX): `encoder_model.onnx` (+ `.onnx_data*`), `decoder_model_merged.onnx` (+ `.onnx_data`), `tokenizer.json` (FP32, FP16, INT8, INT4 variants available)
 
+**Granite Speech 4.1 (base / plus)**: Download from the per-variant ONNX bundles produced by [`sammcj/granite-speech-4.1-onnx`](https://github.com/sammcj/granite-speech-4.1-onnx). Each bundle contains a precision subdirectory (`fp32/`, `fp16w/`, `int8/`) with `encoder.onnx`, `prompt_encode.onnx`, `decode_step.onnx`, `embed_tokens.onnx` (each plus its `.onnx_data` sidecar), and shared root files (`tokenizer.json`, `processor_config.json`, `chat_template.jinja`, `granite_export_metadata.json`). Point `from_pretrained` at the bundle root (not the precision subdir).
+
+**Granite Speech 4.1 NAR**: Same source bundle layout, but the precision subdirectories ship `encoder.onnx`, `editor.onnx`, and `embed_tokens.onnx` (no `prompt_encode` / `decode_step`).
+
 **Diarization (Sortformer v2 & v2.1)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main): `diar_streaming_sortformer_4spk-v2.onnx` or `v2.1.onnx`.
 
 Quantized versions available (int8). All files must be in the same directory.
@@ -180,6 +244,9 @@ let config = ExecutionConfig::new()
 - [Unified: Offline + buffered streaming RNNT ASR (600M params, EN only)](https://huggingface.co/nvidia/parakeet-unified-en-0.6b)
 - [Multitalker: Streaming multi-speaker ASR with speaker-kernel injection](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) ([ONNX int8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8))
 - [Cohere Transcribe: Offline multilingual ASR (14 languages, long-form supported)](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) ([ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX))
+- [Granite Speech 4.1 base 2b: Multilingual ASR + translation + keyword biasing](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) (en/fr/de/es/pt/ja, autoregressive)
+- [Granite Speech 4.1 plus 2b: Speaker-attributed ASR + word timestamps + incremental decoding](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-plus) (no punctuation; trades it for structural features)
+- [Granite Speech 4.1 2b NAR: Single-pass English ASR via bidirectional editor over a CTC draft](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) (no autoregressive loop, no KV cache; English-only transcription)
 - [Sortformer v2 & v2.1: Streaming speaker diarization (up to 4 speakers)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) NOTE: you can also download v2.1 model same way.
 - Token-level timestamps (CTC, TDT)
 
